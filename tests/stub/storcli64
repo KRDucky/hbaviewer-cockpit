@@ -1,0 +1,20 @@
+#!/bin/bash
+# Fake classic storcli that replays upstream's anonymised fixtures (2x SAS3 cards).
+F="${HBAV_FIXTURES:?}/storcli"
+case "$*" in
+  version)                    echo "StorCli SAS Customization Utility Ver 007.3404" ;;
+  show)                       cat "$F/controllers.txt" ;;
+  "/c0 show")                 cat "$F/overview_c0.txt" ;;
+  "/c1 show")                 cat "$F/overview_c1.txt" ;;
+  "/c0 show temperature")     cat "$F/temp_c0.txt" ;;
+  "/c1 show temperature")     cat "$F/temp_c1.txt" ;;
+  "/c0/eall show all")        cat "$F/enclosures_c0.txt" ;;
+  "/c1/eall show all")        cat "$F/enclosures_c1.txt" ;;
+  "/c0/eall/sall show all")   cat "$F/drives_c0.txt" ;;
+  "/c1/eall/sall show all")   cat "$F/drives_c1.txt" ;;
+  "/c0/pall show")            cat "$F/phy_c0.txt" ;;
+  "/c1/pall show")            cat "$F/phy_c1.txt" ;;
+  "/c0 show events")          cat "$F/events_c0.txt" ;;
+  "/c1 show events")          cat "$F/events_c1.txt" ;;
+  *) echo "stub: unhandled: $*" >&2 ;;
+esac

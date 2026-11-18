@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>HBA Viewer</title>
+    <link rel="stylesheet" href="hbaviewer.css">
+    <script src="../base1/cockpit.js"></script>
+    <script src="hbaviewer.js" defer></script>
+    <script src="baymap.js" defer></script>
+</head>
+<body>
+<div id="app">
+    <header class="hv-head">
+        <div class="hv-title">
+            <h1>HBA Viewer</h1>
+            <span class="hv-sub" id="hv-backend">Detecting controllers…</span>
+        </div>
+        <div class="hv-actions">
+            <span class="hv-stamp" id="hv-stamp"></span>
+            <button class="hv-btn" id="hv-refresh" type="button">Refresh</button>
+        </div>
+    </header>
+
+    <div class="hv-alert" id="hv-noadmin" hidden>
+        HBA Viewer reads controllers through storcli/lsiutil and needs administrative access.
+        Turn on <b>Administrative access</b> in Cockpit's top bar, then reload this page.
+    </div>
+
+    <nav class="hv-tabs" role="tablist" id="hv-tabs">
+        <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+        <button role="tab" data-tab="health">Health</button>
+        <button role="tab" data-tab="phy">PHY</button>
+        <button role="tab" data-tab="drives">Drives</button>
+        <button role="tab" data-tab="smart">SMART</button>
+        <button role="tab" data-tab="baymap">Bay Mapper</button>
+        <button role="tab" data-tab="events">Event log</button>
+        <button role="tab" data-tab="perf">Performance</button>
+        <button role="tab" data-tab="settings">Settings</button>
+    </nav>
+
+    <main>
+        <section class="hv-panel" id="tab-overview"></section>
+        <section class="hv-panel" id="tab-health" hidden></section>
+        <section class="hv-panel" id="tab-phy" hidden></section>
+        <section class="hv-panel" id="tab-drives" hidden></section>
+        <section class="hv-panel" id="tab-smart" hidden></section>
+        <section class="hv-panel" id="tab-baymap" hidden></section>
+        <section class="hv-panel" id="tab-events" hidden></section>
+        <section class="hv-panel" id="tab-perf" hidden></section>
+        <section class="hv-panel" id="tab-settings" hidden></section>
+    </main>
+</div>
+
+<div id="bm-print" class="bm-print" aria-hidden="true"></div>
+
+<dialog id="hv-dialog">
+    <div class="hv-dlg-head">
+        <h2 id="hv-dlg-title"></h2>
+        <button class="hv-btn hv-btn-plain" type="button" id="hv-dlg-close" aria-label="Close">✕</button>
+    </div>
+    <div id="hv-dlg-body"></div>
+</dialog>
+</body>
+</html>

@@ -1,0 +1,953 @@
+#!/usr/bin/env python3
+"""hbaviewer-ctl — root-side helper for the HBAviewer Cockpit plugin.
+
+Wraps the upstream Unraid-HBAviewer composer scripts (bash + gawk, unmodified)
+with Ubuntu paths, and ports the PHP-side logic that has no shell equivalent:
+the five-indicator health rollup and its sample ring, the PHY error baseline,
+the firmware event archive, background SMART collection and drive locate.
+
+Every command prints exactly one JSON document on stdout. Errors are
+{"error": "..."} with exit status 0 so the UI can show them inline; a non-zero
+exit only means the helper itself crashed.
+
+    hbaviewer-ctl env
+    hbaviewer-ctl overview | drives | phy | events | metrics
+    hbaviewer-ctl health            # read + ingest into the ring + indicators
+    hbaviewer-ctl sample            # same, quiet; for the systemd timer
+    hbaviewer-ctl smart start|status
+    hbaviewer-ctl smart-one /dev/sdX
+    hbaviewer-ctl baseline set|clear <ctl>
+    hbaviewer-ctl locate start <dev>|stop <dev>|list
+    hbaviewer-ctl config get | config set KEY=VALUE...
+    hbaviewer-ctl baymap get|inventory|locations|history|export|backup|...   (JSON request on stdin)
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+LIB = os.environ.get("HBAV_LIB", "/usr/lib/hbaviewer")
+SCRIPTS = os.environ.get("HBAV_SCRIPTS", os.path.join(LIB, "scripts"))
+LSIUTIL = os.environ.get("HBAV_LSIUTIL", os.path.join(LIB, "lsiutil"))
+ETC = os.environ.get("HBAV_ETC", "/etc/hbaviewer")
+STATE = os.environ.get("HBAV_STATE", "/var/lib/hbaviewer")
+RUN = os.environ.get("HBAV_RUN", "/run/hbaviewer")
+
+SETTINGS = os.path.join(ETC, "settings.json")
+SHELL_CFG = os.path.join(ETC, "hbaviewer.cfg")
+DASH_CACHE = os.path.join(RUN, "dash.json")
+SMART_CACHE = os.path.join(STATE, "smart.json")
+BASELINE = os.path.join(STATE, "phy_baseline.json")
+
+# Where Broadcom's .deb/.rpm put the CLIs on Ubuntu. Upstream's candidate list
+# probes bare names on PATH, so extending PATH is all it takes — no patching.
+EXTRA_PATH = [
+    "/opt/MegaRAID/storcli", "/opt/MegaRAID/storcli2", "/opt/MegaRAID/perccli",
+    "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/sbin",
+]
+
+DEFAULTS = {
+    "ALERT_THRESHOLD": 76,     # legal floors 66 / 76 / 86 / 96, same as upstream
+    "HBA_PORT": 1,
+    "EVENT_LIMIT": 50,
+    "LOCATE_MAX_SECS": 300,
+    "PCIE_EXPECT_WIDTH": 0,
+    "PCIE_EXPECT_GEN": 0,
+    "TEMP_UNIT": "C",
+    "NOTIFY_CMD": "",
+}
+
+HEALTH_RING_CAP = 240
+HEALTH_STALE_SECS = 900
+HEALTH_MIN_CLEAR_SECS = 1800
+PHY_COUNTERS = ["inv", "disp", "sync", "reset"]
+EVENT_ARCHIVE_CAP = 2000
+
+
+# ── plumbing ────────────────────────────────────────────────────────────────
+
+def out(obj):
+    sys.stdout.write(json.dumps(obj))
+    sys.stdout.write("\n")
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}.{os.urandom(4).hex()}"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+class Lock:
+    def __init__(self, name):
+        os.makedirs(STATE, exist_ok=True)
+        self.f = open(os.path.join(STATE, f".{name}.lock"), "w")
+
+    def __enter__(self):
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def settings():
+    s = dict(DEFAULTS)
+    s.update({k: v for k, v in read_json(SETTINGS, {}).items() if k in DEFAULTS})
+    return s
+
+
+def awk_shim():
+    """A dir whose `awk` is gawk. Upstream's parsers call plain `awk` but rely on
+    gawk-only features (3-arg match()); Ubuntu's default awk is mawk. Shimming
+    PATH for our own children avoids repointing the system-wide alternative."""
+    gawk = shutil.which("gawk")
+    if not gawk:
+        return None
+    d = os.path.join(RUN, "shim")
+    link = os.path.join(d, "awk")
+    try:
+        os.makedirs(d, exist_ok=True)
+        if os.path.realpath(link) != os.path.realpath(gawk):
+            tmp = link + f".{os.getpid()}"
+            os.symlink(gawk, tmp)
+            os.replace(tmp, link)
+        return d
+    except OSError:
+        return None
+
+
+def script_env(cfg):
+    env = dict(os.environ)
+    shim = awk_shim()
+    env["PATH"] = ":".join(([shim] if shim else []) + [env.get("PATH", "/usr/bin:/bin")] + EXTRA_PATH)
+    env["LSIUTIL"] = LSIUTIL
+    env["LSI_CFG_PATH"] = SHELL_CFG
+    env["LSI_CACHE"] = DASH_CACHE
+    env["LSI_SMART_CACHE"] = SMART_CACHE
+    env["EVENT_LIMIT"] = str(cfg["EVENT_LIMIT"])
+    env["STORCLI_CWD"] = RUN
+    env["LC_ALL"] = "C"
+    return env
+
+
+def run_script(name, *args, cfg=None, timeout=180):
+    """Run one upstream composer and return its parsed JSON payload."""
+    cfg = cfg or settings()
+    path = os.path.join(SCRIPTS, name)
+    if not os.path.exists(path):
+        return {"error": f"{name} not found under {SCRIPTS}. Re-run install.sh."}
+    os.makedirs(RUN, exist_ok=True)
+    try:
+        # cwd matters: storcli drops a debug log into whatever directory it runs in.
+        p = subprocess.run(["bash", path, *args], cwd=RUN, env=script_env(cfg),
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": f"{name} timed out after {timeout}s — the controller did not answer."}
+    raw = p.stdout.strip()
+    if not raw:
+        return {"error": f"{name} produced no output.", "stderr": p.stderr[-800:]}
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return {"error": f"{name} produced output that is not JSON.", "raw": raw[:800],
+                "stderr": p.stderr[-800:]}
+
+
+def sh(cmd, timeout=30):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=script_env(settings()))
+        return p.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def controllers(payload):
+    if not isinstance(payload, dict) or "error" in payload:
+        return []
+    return payload.get("controllers") or []
+
+
+def uptime():
+    try:
+        with open("/proc/uptime") as f:
+            return int(float(f.read().split()[0]))
+    except (OSError, ValueError):
+        return 0
+
+
+def temp_str(t, unit):
+    if t is None or t == "":
+        return ""
+    try:
+        t = float(t)
+    except (TypeError, ValueError):
+        return ""
+    if unit == "F":
+        return f"{round(t * 9 / 5 + 32)}°F"
+    return f"{round(t)}°C"
+
+
+def age_str(secs):
+    secs = int(secs or 0)
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60} min"
+    if secs < 86400:
+        return f"{secs // 3600} h"
+    return f"{secs // 86400} d"
+
+
+# ── block-device context (replaces Unraid's disks.ini role lookup) ──────────
+
+def serial_key(s):
+    return re.sub(r"\s+", " ", (s or "").strip()).upper()
+
+
+def _lsblk_pairs(cols, scsi=False):
+    args = ["lsblk", "-P", "-o", cols] + (["-S"] if scsi else [])
+    rows = []
+    for line in sh(args).splitlines():
+        rows.append(dict(re.findall(r'([A-Z0-9:_-]+)="([^"]*)"', line)))
+    return rows
+
+
+def block_context():
+    """Per whole disk: serial, hctl, transport, and what it is used for."""
+    disks = {}
+    for r in _lsblk_pairs("NAME,SERIAL,HCTL,TRAN,MODEL,SIZE,WWN", scsi=True):
+        if r.get("NAME"):
+            disks[r["NAME"]] = {"dev": "/dev/" + r["NAME"], "serial": r.get("SERIAL", ""),
+                                "hctl": r.get("HCTL", ""), "tran": r.get("TRAN", ""),
+                                "model": r.get("MODEL", ""), "size": r.get("SIZE", ""),
+                                "wwn": r.get("WWN", ""), "roles": []}
+    # Roles from the whole device tree: ZFS pool (label of a zfs_member), md
+    # array, LVM PV, or plain mountpoint. Walk children back to their disk.
+    rows = _lsblk_pairs("NAME,PKNAME,FSTYPE,LABEL,MOUNTPOINT,TYPE")
+    parent = {r.get("NAME"): r.get("PKNAME") for r in rows}
+
+    def root(n):
+        seen = set()
+        while parent.get(n) and n not in seen:
+            seen.add(n)
+            n = parent[n]
+        return n
+
+    for r in rows:
+        d = disks.get(root(r.get("NAME", "")))
+        if not d:
+            continue
+        fs, label, mp = r.get("FSTYPE", ""), r.get("LABEL", ""), r.get("MOUNTPOINT", "")
+        role = None
+        if fs == "zfs_member":
+            role = f"ZFS {label}" if label else "ZFS"
+        elif fs == "linux_raid_member":
+            role = f"md {label.split(':')[-1]}" if label else "md RAID"
+        elif fs == "LVM2_member":
+            role = "LVM PV"
+        elif mp:
+            role = mp
+        if role and role not in d["roles"]:
+            d["roles"].append(role)
+    by_serial = {serial_key(d["serial"]): d for d in disks.values() if d["serial"]}
+    return disks, by_serial
+
+
+# ── env / diagnostics ───────────────────────────────────────────────────────
+
+def cmd_env(_args):
+    cfg = settings()
+    probe = r'''
+source "$1/lib.sh"
+if use_storcli; then echo "storcli=$STORCLI"; echo "flavor=$STORCLI_FLAVOR"; echo "count=$STORCLI_COUNT"; fi
+echo "personalities=$(hba_personalities | sort | uniq -c | tr -s ' ' | tr '\n' ';')"
+echo "driver=$(hba_driver)"
+'''
+    os.makedirs(RUN, exist_ok=True)
+    p = subprocess.run(["bash", "-c", probe, "probe", SCRIPTS], cwd=RUN,
+                       env=script_env(cfg), capture_output=True, text=True, timeout=60)
+    kv = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+    if kv.get("flavor"):
+        backend = kv["flavor"]
+    elif "mpt2sas" in kv.get("personalities", "") or "mptsas" in kv.get("personalities", ""):
+        backend = "lsiutil"
+    else:
+        backend = None
+    pci = [l for l in sh(["lspci", "-nn", "-d", "1000:"]).splitlines() if l.strip()]
+    smartctl = (sh(["smartctl", "--version"]).splitlines() or [""])[0]
+    os_release = dict(re.findall(r'^(\w+)="?([^"\n]*)"?$', open("/etc/os-release").read(), re.M)) \
+        if os.path.exists("/etc/os-release") else {}
+    out({
+        "backend": backend,
+        "storcli": kv.get("storcli"), "storcli_flavor": kv.get("flavor"),
+        "storcli_count": kv.get("count"),
+        "lsiutil": LSIUTIL if os.access(LSIUTIL, os.X_OK) else None,
+        "personalities": kv.get("personalities", "").strip(";"),
+        "driver": kv.get("driver", ""),
+        "pci": pci, "smartctl": smartctl or None,
+        "gawk": shutil.which("gawk") is not None,
+        "systemd_run": shutil.which("systemd-run") is not None,
+        "os": os_release.get("PRETTY_NAME", ""), "kernel": os.uname().release,
+        "settings": cfg,
+    })
+
+
+# ── overview ────────────────────────────────────────────────────────────────
+
+def physical_cards(data):
+    """Group controller functions into physical cards from sysfs (read-only, cheap).
+    Each controller index is matched to a function by PCI bus; unmatched stays unmatched."""
+    try:
+        mod, ctx = baymap_ctx()
+        hosts, phys = mod._hosts(ctx), mod._phys(ctx)
+    except Exception:   # noqa: BLE001 — a missing sysfs must never break the Overview
+        return []
+    funcs = []
+    for h in sorted(hosts.values(), key=lambda h: h["pci"]):
+        if h["driver"] not in ("mpt3sas", "mpt2sas", "mptsas", "megaraid_sas", "mpi3mr") or not h["pci"]:
+            continue
+        ph = phys.get(h["host"], [])
+        funcs.append({"pci": h["pci"], "host": h["host"], "driver": h["driver"], "host_sas": h["host_sas"],
+                      "board_name": h["board_name"], "board_serial": h["board_serial"], "fw": h["fw"], "ctl_index": None,
+                      "pci_path": h["pci_path"], "phys": ph, "phys_total": len(ph),
+                      "phys_linked": sum(1 for p in ph if p["active"]), "drives": 0})
+    for i, c in enumerate(controllers(data)):
+        g = re.findall(r"[0-9a-fA-F]+", c.get("pci_location") or "")
+        bus = (g[1] if len(g) >= 4 else g[0]).lower().zfill(2) if g else None
+        hits = [f for f in funcs if bus and f["pci"].split(":")[1] == bus[-2:]]
+        if len(hits) == 1:
+            hits[0]["ctl_index"] = i
+    return mod.group_functions(funcs) if funcs else []
+
+
+def cmd_overview(_args):
+    data = run_script("get_hba_info.sh")
+    if isinstance(data, dict) and "error" not in data:
+        data["physical"] = physical_cards(data)
+    out(data)
+
+
+def cmd_metrics(_args):
+    out(run_script("get_metrics.sh", timeout=20))
+
+
+# ── drives ──────────────────────────────────────────────────────────────────
+
+def cmd_drives(_args):
+    data = run_script("get_attached_drives.sh")
+    disks, by_serial = block_context()
+    for c in controllers(data):
+        for d in c.get("drives") or []:
+            dev = d.get("os_name") or ""
+            ctx = None
+            if dev:
+                ctx = disks.get(dev.replace("/dev/", ""))
+            elif d.get("serial"):
+                ctx = by_serial.get(serial_key(d["serial"]))
+            if ctx:
+                d["dev"] = ctx["dev"]
+                d["hctl"] = ctx["hctl"]
+                d["tran"] = ctx["tran"]
+                d["roles"] = ctx["roles"]
+                d.setdefault("model", ctx["model"])
+                if not d.get("serial"):
+                    d["serial"] = ctx["serial"]
+                if not d.get("size"):
+                    d["size"] = ctx["size"]
+            else:
+                d["dev"] = dev or None
+    if isinstance(data, dict) and "error" not in data:
+        data["locating"] = locate_active()
+    out(data)
+
+
+# ── PHY + baseline ──────────────────────────────────────────────────────────
+
+def baseline_delta(base, phy, now, up):
+    if not isinstance(base, dict) or "ts" not in base:
+        return None
+    if up > 0 and int(base.get("up", 0)) > 0 and up < int(base["up"]):
+        return {"reset": True}
+    hours = max((now - int(base["ts"])) / 3600.0, 1 / 60.0)
+    res = {"reset": False, "ts": int(base["ts"]), "delta": {}, "rate": {}}
+    for k in PHY_COUNTERS:
+        d = int(phy.get(k) or 0) - int(base.get(k) or 0)
+        if d < 0:
+            return {"reset": True}
+        res["delta"][k] = d
+        res["rate"][k] = d / hours
+    return res
+
+
+def cmd_phy(_args):
+    data = run_script("get_phy_health.sh")
+    b = read_json(BASELINE, {})
+    now, up = int(time.time()), uptime()
+    for i, c in enumerate(controllers(data)):
+        ts = None
+        for p in c.get("phys") or []:
+            e = b.get(f"{i}:{int(p.get('phy', -1))}")
+            p["base"] = baseline_delta(e, p, now, up)
+            if e and ts is None:
+                ts = e.get("ts")
+        c["baseline_ts"] = ts
+    if isinstance(data, dict):
+        data["now"] = now
+    out(data)
+
+
+def cmd_baseline(args):
+    if len(args) != 2 or args[0] not in ("set", "clear") or not args[1].isdigit():
+        return out({"error": "usage: baseline set|clear <controller>"})
+    ctl = int(args[1])
+    with Lock("baseline"):
+        b = read_json(BASELINE, {})
+        b = {k: v for k, v in b.items() if not k.startswith(f"{ctl}:")}
+        if args[0] == "set":
+            cs = controllers(run_script("get_phy_health.sh"))
+            if ctl >= len(cs) or not cs[ctl].get("phys"):
+                return out({"error": f"No PHY data for controller /c{ctl}."})
+            now, up = int(time.time()), uptime()
+            for p in cs[ctl]["phys"]:
+                if "phy" not in p:
+                    continue
+                e = {"ts": now, "up": up}
+                e.update({k: int(p.get(k) or 0) for k in PHY_COUNTERS})
+                b[f"{ctl}:{int(p['phy'])}"] = e
+        write_json(BASELINE, b)
+    out({"ok": True})
+
+
+# ── events + archive ────────────────────────────────────────────────────────
+
+def cmd_events(_args):
+    data = run_script("get_event_log.sh")
+    with Lock("events"):
+        for i, c in enumerate(controllers(data)):
+            if "entries" not in c:
+                continue
+            path = os.path.join(STATE, f"events-{i}.json")
+            arch = read_json(path, [])
+            seen = {(e.get("seq"), e.get("time"), e.get("description")) for e in arch}
+            new = 0
+            for e in c["entries"]:
+                k = (e.get("seq"), e.get("time"), e.get("description"))
+                if k not in seen:
+                    arch.append(e)
+                    seen.add(k)
+                    new += 1
+            arch = arch[-EVENT_ARCHIVE_CAP:]
+            if new or not os.path.exists(path):
+                write_json(path, arch)
+            c["live_count"] = len(c["entries"])
+            c["entries"] = list(reversed(arch))
+            c["archived"] = len(arch)
+    out(data)
+
+
+# ── health (port of upstream health.php) ────────────────────────────────────
+
+RANK = {"ok": 0, "watch": 1, "warning": 2, "critical": 3}
+
+
+def _idx_counts(phys):
+    c = {}
+    for p in phys or []:
+        c[p.get("idx")] = c.get(p.get("idx"), 0) + 1
+    return c
+
+
+def health_ingest(ring, sample):
+    if ring:
+        newest = ring[-1]
+        reset = sample.get("uptime", 0) < newest.get("uptime", 0)
+        if not reset:
+            prev = {p.get("idx"): p for p in newest.get("phys") or []}
+            pc, cc = _idx_counts(newest.get("phys")), _idx_counts(sample.get("phys"))
+            for p in sample.get("phys") or []:
+                q = prev.get(p.get("idx"))
+                if q is None or pc.get(p.get("idx"), 0) > 1 or cc.get(p.get("idx"), 0) > 1:
+                    continue
+                if any((p.get(k) or 0) < (q.get(k) or 0) for k in ("inv", "disp", "sync", "rst")):
+                    reset = True
+                    break
+        if reset:
+            ring = []
+    ring.append(sample)
+    return ring[-HEALTH_RING_CAP:]
+
+
+def health_span(ring):
+    if len(ring) < 2:
+        return None
+    dt = ring[-1].get("t", 0) - ring[0].get("t", 0)
+    return dt if dt >= 60 else None
+
+
+def health_rates(ring):
+    span = health_span(ring)
+    if span is None:
+        return []
+    hrs = span / 3600.0
+    old, new = ring[0], ring[-1]
+    ob = {p.get("idx"): p for p in old.get("phys") or []}
+    oc, nc = _idx_counts(old.get("phys")), _idx_counts(new.get("phys"))
+    rates = []
+    for p in new.get("phys") or []:
+        q = ob.get(p.get("idx"))
+        if q is None or oc.get(p.get("idx"), 0) > 1 or nc.get(p.get("idx"), 0) > 1:
+            continue
+        r = {"idx": p.get("idx")}
+        for k in ("inv", "disp", "sync", "rst"):
+            r[k] = max(0, (p.get(k) or 0) - (q.get(k) or 0)) / hrs
+        rates.append(r)
+    return rates
+
+
+def rate_state(counter, rate):
+    if rate <= 0:
+        return "ok"
+    if counter in ("inv", "disp"):
+        return "watch" if rate <= 50 else "warning" if rate <= 500 else "critical"
+    return "warning" if rate < 10 else "critical"
+
+
+def rate_num(s):
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", s or "")
+    return float(m.group(1)) if m else None
+
+
+def rate_str(r):
+    if 0 < r < 0.05:
+        return "<0.1/hr"
+    return (f"{r:.1f}" if 0 < r < 10 else f"{r:,.0f}") + "/hr"
+
+
+GEN_RATE = {1: 2.5, 2: 5.0, 3: 8.0, 4: 16.0, 5: 32.0, 6: 64.0}
+
+
+def link_expected(link, cfg):
+    cw, cs = int(link.get("max_width") or 0), rate_num(link.get("max_speed"))
+    sw, ss = int(link.get("slot_width") or 0), rate_num(link.get("slot_speed"))
+    setw, setg = int(cfg.get("PCIE_EXPECT_WIDTH") or 0), int(cfg.get("PCIE_EXPECT_GEN") or 0)
+    why, w = "card", cw
+    if sw > 0 and (cw <= 0 or sw < cw):
+        w, why = sw, "slot"
+    if setw > 0:
+        w, why = setw, "set"
+    sp = cs
+    if ss is not None and (cs is None or ss < cs):
+        sp = ss
+        if why == "card":
+            why = "slot"
+    if setg > 0:
+        sp, why = GEN_RATE.get(setg), "set"
+    return w, sp, why
+
+
+def speed_label(link, exp):
+    ms = link.get("max_speed") or ""
+    if exp is not None and ms and rate_num(ms) == exp:
+        return ms
+    return "" if exp is None else f"{exp:g} GT/s"
+
+
+def health_indicators(ring, rates, now, cfg):
+    newest = ring[-1] if ring else None
+    unit = cfg.get("TEMP_UNIT", "C")
+
+    band = (newest or {}).get("temp_band") or ""
+    tmap = {"normal": "ok", "elevated": "watch", "warning": "warning", "alert": "critical", "critical": "critical"}
+    if band in tmap:
+        ts = temp_str(newest.get("temp"), unit)
+        thermal = {"state": tmap[band], "value": ts or "—",
+                   "reason": f"{ts} — {band.capitalize()} band" if ts else band.capitalize()}
+    else:
+        thermal = {"state": "unknown", "reason": "No temperature reading", "value": "—"}
+
+    if not rates:
+        li = {"state": "unknown", "value": "—",
+              "reason": "Not enough samples yet — needs two reads at least a minute apart"}
+    else:
+        span = health_span(ring)
+        sp = age_str(span or 0)
+        labels = {"inv": "invalid dword", "disp": "disparity", "sync": "loss of sync", "rst": "reset problem"}
+        ws, wr, wv = "ok", f"No new cabling errors on any PHY in the last {sp}", "0/hr"
+        wrank = 0
+        for r in rates:
+            for k, lab in labels.items():
+                s = rate_state(k, r[k])
+                if RANK[s] > wrank:
+                    wrank, ws, wv = RANK[s], s, rate_str(r[k])
+                    wr = f"PHY {r['idx']} {lab} errors rising ({rate_str(r[k])} over the last {sp})"
+        if ws == "ok" and (span is None or span < HEALTH_MIN_CLEAR_SECS):
+            ws, wr = "unknown", f"Watched for {sp} — too short to rule out a slow fault"
+        li = {"state": ws, "reason": wr, "value": wv}
+
+    seen = [int(s.get("drives") or 0) for s in ring]
+    base = max(seen) if seen else 0
+    cur = int((newest or {}).get("drives") or 0)
+    if base < 1:
+        topo = {"state": "unknown", "reason": "No drive count available for this controller", "value": "—"}
+    elif cur < base:
+        topo = {"state": "critical", "reason": f"Drive missing — {cur} of the {base} seen before", "value": f"{cur}/{base}"}
+    else:
+        topo = {"state": "ok", "reason": f"All {cur} attached drives present",
+                "value": f"{cur} drive" + ("" if cur == 1 else "s")}
+
+    link = (newest or {}).get("link") or {}
+    w, mw = int(link.get("width") or 0), int(link.get("max_width") or 0)
+    s = rate_num(link.get("speed"))
+    ew, es, why = link_expected(link, cfg)
+    if (ew > 0 and 0 < w < ew) or (es is not None and s is not None and s < es):
+        hl = {"state": "warning", "value": f"x{w} / x{ew}",
+              "reason": f"PCIe link downtrained: x{w} {link.get('speed', '')} of x{ew} {speed_label(link, es)} expected"}
+    elif w <= 0:
+        hl = {"state": "ok", "reason": "No PCIe downtraining reported", "value": "—"}
+    else:
+        at = f"Running at x{w}" + (f" {link['speed']}" if link.get("speed") else "")
+        if why == "set":
+            why_s = " — matches the expected link you set"
+        elif why == "slot":
+            why_s = " — this slot's maximum" + (f" (card supports x{mw})" if mw > ew else "")
+        elif not (ew > 0 or es is not None):
+            why_s = " — this controller reports no maximum, so there is nothing to check it against"
+        elif int(link.get("slot_width") or 0) <= 0:
+            why_s = " — the full width this card reports"
+        else:
+            why_s = " — the full width of both card and slot"
+        hl = {"state": "ok", "value": f"x{w}", "reason": at + why_s}
+
+    if newest is None:
+        ctl = {"state": "unknown", "reason": "No samples yet", "value": "—"}
+    elif not newest.get("read_ok"):
+        ctl = {"state": "unknown", "reason": "The last read of this controller failed", "value": "Read failed"}
+    elif now - newest.get("t", 0) > HEALTH_STALE_SECS:
+        age = now - newest.get("t", 0)
+        ctl = {"state": "unknown", "reason": f"Stale — no reading in {age}s", "value": f"{age}s old"}
+    else:
+        ctl = {"state": "ok", "reason": "Controller answered the last query normally", "value": "OK"}
+
+    return {"thermal": thermal, "link_integrity": li, "topology": topo, "host_link": hl, "controller": ctl}
+
+
+def health_rollup(ind):
+    worst, wrank, unk = None, -1, None
+    for i in ind.values():
+        if i["state"] == "unknown":
+            unk = unk or i
+            continue
+        if RANK[i["state"]] > wrank:
+            wrank, worst = RANK[i["state"]], i
+    if worst is None:
+        return "unknown", (unk or {}).get("reason", "unknown")
+    if unk and wrank < RANK["warning"]:
+        return "unknown", unk["reason"]
+    return worst["state"], worst["reason"]
+
+
+def health_collect(cfg):
+    data = run_script("get_hba_health.sh", cfg=cfg)
+    if not isinstance(data, dict) or "error" in data:
+        return data, []
+    now = int(time.time())
+    result = []
+    with Lock("health"):
+        for i, sample in enumerate(controllers(data)):
+            path = os.path.join(STATE, f"health-{i}.json")
+            ring = health_ingest(read_json(path, []), sample)
+            write_json(path, ring)
+            rates = health_rates(ring)
+            ind = health_indicators(ring, rates, now, cfg)
+            state, reason = health_rollup(ind)
+            ok = sum(1 for v in ind.values() if v["state"] == "ok")
+            result.append({"idx": i, "state": state, "reason": reason, "indicators": ind,
+                           "ok": ok, "total": len(ind), "samples": len(ring),
+                           "span": health_span(ring), "sample": sample,
+                           "rates": rates})
+    return data, result
+
+
+def notify_transitions(cfg, result):
+    path = os.path.join(STATE, "last_status.json")
+    last = read_json(path, {})
+    changed = False
+    for r in result:
+        key = str(r["idx"])
+        prev = last.get(key)
+        if prev == r["state"]:
+            continue
+        last[key] = r["state"]
+        changed = True
+        if prev is None:
+            continue   # first observation is not a transition
+        msg = f"HBA /c{r['idx']} health {prev} -> {r['state']}: {r['reason']}"
+        prio = "warning" if r["state"] in ("warning", "critical") else "info"
+        subprocess.run(["logger", "-t", "hbaviewer", "-p", f"daemon.{prio}", msg], check=False)
+        cmd = (cfg.get("NOTIFY_CMD") or "").strip()
+        if cmd:
+            env = dict(os.environ, HBAV_CTL=key, HBAV_PREV=prev, HBAV_STATE=r["state"],
+                       HBAV_REASON=r["reason"], HBAV_MESSAGE=msg)
+            try:
+                subprocess.run(["/bin/sh", "-c", cmd], env=env, timeout=60, check=False)
+            except subprocess.TimeoutExpired:
+                pass
+    if changed:
+        write_json(path, last)
+
+
+def cmd_health(_args, quiet=False):
+    cfg = settings()
+    data, result = health_collect(cfg)
+    if result:
+        notify_transitions(cfg, result)
+    if quiet:
+        return out({"ok": not (isinstance(data, dict) and "error" in data), "controllers": len(result)})
+    if isinstance(data, dict) and "error" in data:
+        return out(data)
+    out({"backend": data.get("backend"), "driver": data.get("driver"), "now": int(time.time()),
+         "controllers": result})
+
+
+# ── SMART ───────────────────────────────────────────────────────────────────
+
+def _detached(unit, argv, cfg):
+    """Run argv outside the Cockpit channel so closing the page does not kill it."""
+    env = script_env(cfg)
+    if shutil.which("systemd-run") and os.environ.get("HBAV_NO_SYSTEMD") != "1":
+        setenv = [f"--setenv={k}={env[k]}" for k in
+                  ("PATH", "LSIUTIL", "LSI_CFG_PATH", "LSI_CACHE", "LSI_SMART_CACHE", "STORCLI_CWD")]
+        r = subprocess.run(["systemd-run", f"--unit={unit}", "--collect", "--quiet",
+                            f"--working-directory={RUN}", *setenv, *argv],
+                           capture_output=True, text=True)
+        return r.returncode == 0, r.stderr.strip()
+    subprocess.Popen(argv, cwd=RUN, env=env, start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    return True, ""
+
+
+def cmd_smart(args):
+    sub = args[0] if args else "status"
+    prog = SMART_CACHE + ".progress"
+    if sub == "start":
+        running = os.path.exists(prog) and time.time() - os.path.getmtime(prog) < 120
+        if not running:
+            os.makedirs(STATE, exist_ok=True)
+            os.makedirs(RUN, exist_ok=True)
+            with open(prog, "w") as f:
+                f.write("0/?")
+            ok, err = _detached("hbaviewer-smart", ["bash", os.path.join(SCRIPTS, "collect_smart.sh")], settings())
+            if not ok:
+                os.unlink(prog)
+                return out({"error": f"Could not start SMART collection: {err}"})
+    res = {"state": "none"}
+    if os.path.exists(prog) and time.time() - os.path.getmtime(prog) < 120:
+        res["state"] = "running"
+        res["progress"] = open(prog).read().strip()
+    if os.path.exists(SMART_CACHE):
+        res.setdefault("state", "ready")
+        if res["state"] == "none":
+            res["state"] = "ready"
+        res["collected_at"] = int(os.path.getmtime(SMART_CACHE))
+        data = read_json(SMART_CACHE, {"drives": []})
+        disks, _ = block_context()
+        for d in data.get("drives", []):
+            ctx = disks.get((d.get("dev") or "").replace("/dev/", ""))
+            d["roles"] = ctx["roles"] if ctx else []
+        res["data"] = data
+    out(res)
+
+
+def cmd_smart_one(args):
+    dev = args[0] if args else ""
+    if not re.fullmatch(r"/dev/sd[a-z]{1,3}", dev):
+        return out({"error": "Expected a /dev/sdX device."})
+    full = sh(["smartctl", "-x", dev], timeout=60)
+    out({"dev": dev, "parsed": run_script("read_smart.sh", dev, timeout=60), "raw": full[-60000:]})
+
+
+# ── locate (activity-LED blink) ─────────────────────────────────────────────
+
+def _unit_for(hctl):
+    return "hbaviewer-locate-" + hctl.replace(":", "-")
+
+
+def locate_active():
+    if not shutil.which("systemctl"):
+        return []
+    o = sh(["systemctl", "list-units", "--plain", "--no-legend", "--state=active",
+            "hbaviewer-locate-*"])
+    act = []
+    for line in o.splitlines():
+        m = re.match(r"hbaviewer-locate-([0-9-]+)\.service", line.strip())
+        if m:
+            act.append(m.group(1).replace("-", ":"))
+    return act
+
+
+def _locate_target(dev):
+    if not re.fullmatch(r"/dev/sd[a-z]{1,3}", dev or ""):
+        return None, {"error": "Expected a /dev/sdX device."}
+    disks, _ = block_context()
+    hctl = (disks.get(dev[5:]) or {}).get("hctl", "")
+    if not re.fullmatch(r"\d+:\d+:\d+:\d+", hctl):
+        return None, {"error": f"No SCSI address for {dev}."}
+    return hctl, None
+
+
+def locate_start(dev):
+    hctl, err = _locate_target(dev)
+    if err:
+        return err
+    bsg = os.environ.get("HBAV_BSG_DIR", "/dev/bsg")
+    if not os.path.exists(f"{bsg}/{hctl}"):
+        return {"error": f"{bsg}/{hctl} does not exist, so the drive cannot be pulsed."}
+    secs = max(30, min(1800, int(settings()["LOCATE_MAX_SECS"])))
+    ok, err = _detached(_unit_for(hctl), ["bash", os.path.join(SCRIPTS, "locate_drive.sh"), hctl, str(secs)], settings())
+    if not ok:
+        return {"error": f"Could not start locate: {err}"}
+    return {"ok": True, "secs": secs, "active": locate_active()}
+
+
+def locate_stop(dev):
+    hctl, err = _locate_target(dev)
+    if err:
+        return err
+    subprocess.run(["systemctl", "stop", _unit_for(hctl) + ".service"], capture_output=True)
+    return {"ok": True, "active": locate_active()}
+
+
+def cmd_locate(args):
+    sub = args[0] if args else "list"
+    if sub == "list":
+        return out({"active": locate_active()})
+    dev = args[1] if len(args) > 1 else ""
+    if sub == "stop":
+        return out(locate_stop(dev))
+    if sub == "start":
+        return out(locate_start(dev))
+    out({"error": "usage: locate start|stop <dev> | list"})
+
+
+# ── bay mapper ──────────────────────────────────────────────────────────────
+
+def baymap_ctx():
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    sys.dont_write_bytecode = True      # no __pycache__ under /usr/lib/hbaviewer
+    import hbav_baymap
+    return hbav_baymap, hbav_baymap.Ctx(ETC, STATE, sh, run_script, block_context, Lock, locate_start, locate_stop,
+                                        locate_active, settings)
+
+
+def cmd_baymap(args):
+    mod, ctx = baymap_ctx()
+    out(mod.run(ctx, args, sys.stdin))
+
+
+# ── config ──────────────────────────────────────────────────────────────────
+
+def _validate(k, v):
+    if k == "ALERT_THRESHOLD":
+        v = int(v)
+        if v not in (66, 76, 86, 96):
+            raise ValueError("ALERT_THRESHOLD must be 66, 76, 86 or 96")
+    elif k == "HBA_PORT":
+        v = int(v)
+        if not 1 <= v <= 32:
+            raise ValueError("HBA_PORT must be 1-32")
+    elif k == "EVENT_LIMIT":
+        v = max(10, min(500, int(v)))
+    elif k == "LOCATE_MAX_SECS":
+        v = max(30, min(1800, int(v)))
+    elif k == "PCIE_EXPECT_WIDTH":
+        v = int(v)
+        if v not in (0, 1, 2, 4, 8, 16):
+            raise ValueError("PCIE_EXPECT_WIDTH must be 0 (auto), 1, 2, 4, 8 or 16")
+    elif k == "PCIE_EXPECT_GEN":
+        v = int(v)
+        if not 0 <= v <= 6:
+            raise ValueError("PCIE_EXPECT_GEN must be 0 (auto) to 6")
+    elif k == "TEMP_UNIT":
+        v = str(v).upper()
+        if v not in ("C", "F"):
+            raise ValueError("TEMP_UNIT must be C or F")
+    elif k == "NOTIFY_CMD":
+        v = str(v)
+        if "\n" in v or len(v) > 1000:
+            raise ValueError("NOTIFY_CMD must be a single line")
+    else:
+        raise ValueError(f"Unknown setting {k}")
+    return v
+
+
+def write_shell_cfg(s):
+    # Only integers reach the file upstream's config.sh sources as bash.
+    write_text = (f'ALERT_THRESHOLD="{int(s["ALERT_THRESHOLD"])}"\n'
+                  f'HBA_PORT="{int(s["HBA_PORT"])}"\n')
+    os.makedirs(ETC, exist_ok=True)
+    tmp = SHELL_CFG + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(write_text)
+    os.replace(tmp, SHELL_CFG)
+
+
+def cmd_config(args):
+    if not args or args[0] == "get":
+        return out(settings())
+    if args[0] != "set":
+        return out({"error": "usage: config get | config set KEY=VALUE..."})
+    s = settings()
+    try:
+        for a in args[1:]:
+            k, _, v = a.partition("=")
+            s[k] = _validate(k, v)
+    except ValueError as e:
+        return out({"error": str(e)})
+    write_json(SETTINGS, s)
+    write_shell_cfg(s)
+    try:
+        os.unlink(DASH_CACHE)   # bands depend on the threshold
+    except OSError:
+        pass
+    out(s)
+
+
+COMMANDS = {
+    "env": cmd_env, "overview": cmd_overview, "metrics": cmd_metrics,
+    "drives": cmd_drives, "phy": cmd_phy, "events": cmd_events,
+    "health": cmd_health, "sample": lambda a: cmd_health(a, quiet=True),
+    "smart": cmd_smart, "smart-one": cmd_smart_one,
+    "baseline": cmd_baseline, "locate": cmd_locate, "config": cmd_config, "baymap": cmd_baymap,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        out({"error": "usage: hbaviewer-ctl " + "|".join(COMMANDS)})
+        return 2
+    if os.geteuid() != 0 and os.environ.get("HBAV_ALLOW_NONROOT") != "1":
+        out({"error": "hbaviewer-ctl must run as root (Cockpit: turn on administrative access)."})
+        return 0
+    COMMANDS[sys.argv[1]](sys.argv[2:])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

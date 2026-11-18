@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""lsblk stand-in for tests: serves $HBAV_LSBLK_FIXTURE (written by tests/fake_hw.py).
+Without that variable it runs the real lsblk, so the other tests are unaffected."""
+import json
+import os
+import sys
+
+fx = os.environ.get("HBAV_LSBLK_FIXTURE")
+if not fx:
+    for p in ("/usr/bin/lsblk", "/bin/lsblk"):
+        if os.path.exists(p):
+            os.execv(p, [p] + sys.argv[1:])
+    sys.exit(1)
+if os.environ.get("HBAV_LSBLK_FAIL") == "1":
+    print("lsblk: failed to access sysfs", file=sys.stderr)
+    sys.exit(32)
+fix = json.load(open(fx))
+args = sys.argv[1:]
+cols = args[args.index("-o") + 1].split(",") if "-o" in args else ["NAME"]
+disks, parts = fix["disks"], fix["parts"]
+
+
+def val(row, col, is_part):
+    c = col.lower()
+    if c == "pkname":
+        return row.get("pkname", "") if is_part else ""
+    if c == "type":
+        return "part" if is_part else "disk"
+    if c == "mountpoint":
+        return row.get("mountpoint", "")
+    v = row.get(c)
+    if c == "rota" and v is not None:
+        return v
+    return "" if v is None else v
+
+
+if "-J" in args:
+    rows = disks if "-d" in args else disks + parts
+    out = []
+    for r in rows:
+        ip = r in parts
+        o = {}
+        for c in cols:
+            v = val(r, c, ip)
+            if c.lower() == "size" and "-b" in args:
+                v = int(v) if v != "" else None
+            elif c.lower() == "wwn" and v == "":
+                v = None
+            o[c.lower()] = v
+        out.append(o)
+    print(json.dumps({"blockdevices": out}))
+elif "-P" in args:
+    rows = disks if "-S" in args else disks + parts
+    for r in rows:
+        ip = r in parts
+        print(" ".join(f'{c}="{val(r, c, ip) if not isinstance(val(r, c, ip), bool) else int(val(r, c, ip))}"' for c in cols))

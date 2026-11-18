@@ -1,0 +1,25 @@
+{
+    "version": 0,
+    "name": "hbaviewer",
+    "requires": {
+        "cockpit": "300"
+    },
+    "tools": {
+        "index": {
+            "label": "HBA Viewer",
+            "order": 45,
+            "docs": [
+                {
+                    "label": "Upstream project",
+                    "url": "https://github.com/FugginOld/Unraid-HBAviewer"
+                }
+            ],
+            "keywords": [
+                {
+                    "matches": ["hba", "lsi", "broadcom", "sas", "storcli", "lsiutil", "phy", "smart", "controller"]
+                }
+            ]
+        }
+    },
+    "content-security-policy": "default-src 'self'; connect-src 'self' ws: wss:; font-src 'self' data:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'"
+}
